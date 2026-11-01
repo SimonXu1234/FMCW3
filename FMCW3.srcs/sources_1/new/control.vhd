@@ -54,6 +54,17 @@ architecture Behavioral of control is
     
     signal s_usb_tx_done : std_logic := '0'; -- to prevent stopping and sending control done before sending last ramps all bytes.
 
+    -- Frame header ("magic word") sent before every frame's samples.
+    -- The 245-style USB FIFO path can drop or insert a single byte at a USB
+    -- transaction boundary, which shifts the 4-byte sample frame.  Instead of
+    -- demanding a byte-perfect stream, mark every frame with a pattern that
+    -- cannot occur in sample data: every valid sample has A[15:8] = 0x00..0x0F
+    -- (the filtered ramp stays within +-4k), so 0xF0 in both high-byte
+    -- positions can never appear in real samples.
+    --   magic byte order on the wire: 0xF0, 0x0D, 0xF0, 0x0D
+    signal hdr_done      : std_logic := '0';
+    signal hdr_sel       : integer range 0 to 3 := 0;
+
 begin
 
     -- Latch ADC data when valid
@@ -85,6 +96,8 @@ begin
             usb_writedata   <= (others => '0');
             ramp_done       <= '0';
             s_usb_tx_done   <= '0';
+            hdr_done        <= '0';
+            hdr_sel         <= 0;
 
         elsif rising_edge(clk) then
             
@@ -144,6 +157,8 @@ begin
                     usb_write_n     <= '1';
                     usb_idx         <= 0;
                     byte_sel        <= 0;
+                    hdr_done        <= '0';   -- next upload starts with a fresh frame header
+                    hdr_sel         <= 0;
                     state           <= USB_TX_IDLE;
 
                 -- USB_TX_IDLE: setup next byte, write_n high
@@ -154,29 +169,45 @@ begin
                     usb_chipselect  <= '1';
                     usb_write_n     <= '1';
                     
-                    -- Send current byte while usb's tx buffer is not full else it will wait in this state
-                    if usb_idx < sample_count and usb_tx_full = '0' then
-                    
-                        -- drive data for next byte
-                        -- adc stores 2 channel 16 bit data as concatenated 32 bit so select each byte
-                        case byte_sel is
-                            when 0      => usb_writedata <= mem(usb_idx)(31 downto 24);
-                            when 1      => usb_writedata <= mem(usb_idx)(23 downto 16);
-                            when 2      => usb_writedata <= mem(usb_idx)(15 downto 8);
-                            when 3      => usb_writedata <= mem(usb_idx)(7 downto 0);
-                            when others => usb_writedata <= (others => '0');
-                        end case;
-                    
-                        state <= USB_TX_PULSE;
-                    
-                    -- End transfer phase since all sampled adc bytes are transffered, go to idle to start for new ramp.
-                    elsif usb_idx >= sample_count then
-                    
-                        -- usb transfer send all bytes before gap is finished, return to idle for resampling
-                        state <= IDLE;
-                        s_usb_tx_done <= '1';      -- <-- Latch USB transfer done here          
-                        usb_writedata <= (others => '0');
-                    
+                    -- Send frame header first, then the samples, while the usb
+                    -- tx buffer has room (otherwise wait here -> backpressure).
+                    if usb_tx_full = '0' then
+
+                        if hdr_done = '0' then
+
+                            -- frame header (4 bytes, see magic note in the signal list)
+                            case hdr_sel is
+                                when 0      => usb_writedata <= x"F0";
+                                when 1      => usb_writedata <= x"0D";
+                                when 2      => usb_writedata <= x"F0";
+                                when others => usb_writedata <= x"0D";
+                            end case;
+
+                            state <= USB_TX_PULSE;
+
+                        elsif usb_idx < sample_count then
+
+                            -- drive data for next byte
+                            -- adc stores 2 channel 16 bit data as concatenated 32 bit so select each byte
+                            case byte_sel is
+                                when 0      => usb_writedata <= mem(usb_idx)(31 downto 24);
+                                when 1      => usb_writedata <= mem(usb_idx)(23 downto 16);
+                                when 2      => usb_writedata <= mem(usb_idx)(15 downto 8);
+                                when 3      => usb_writedata <= mem(usb_idx)(7 downto 0);
+                                when others => usb_writedata <= (others => '0');
+                            end case;
+
+                            state <= USB_TX_PULSE;
+
+                        else
+
+                            -- all header + sample bytes are out, wait for the next ramp
+                            state <= IDLE;
+                            s_usb_tx_done <= '1';      -- <-- Latch USB transfer done here
+                            usb_writedata <= (others => '0');
+
+                        end if;
+
                     end if;
 
                 -- USB_TX_PULSE: pulse write_n low for 1 clock
@@ -186,7 +217,14 @@ begin
                     usb_chipselect  <= '1';
                     usb_write_n     <= '0';                    
 
-                    if byte_sel = 3 then
+                    if hdr_done = '0' then
+                        if hdr_sel = 3 then
+                            hdr_done <= '1';
+                            hdr_sel  <= 0;
+                        else
+                            hdr_sel <= hdr_sel + 1;
+                        end if;
+                    elsif byte_sel = 3 then
                         byte_sel    <= 0;
                         usb_idx     <= usb_idx + 1;
                     else

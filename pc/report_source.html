@@ -1,0 +1,330 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>FMCW3 进展报告</title>
+<style>
+body { font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", SimSun, sans-serif; font-size: 10.5pt; line-height: 1.5; }
+h1 { color: #1F3864; font-size: 20pt; }
+h2 { color: #1F3864; font-size: 15pt; border-bottom: 1px solid #8EA9DB; padding-bottom: 3px; }
+h3 { color: #2E5496; font-size: 12pt; }
+h4 { color: #2E5496; font-size: 11pt; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #7F7F7F; padding: 4px 6px; vertical-align: top; font-size: 9.5pt; }
+th { background-color: #D9E2F3; text-align: left; }
+code { font-family: "DejaVu Sans Mono", Consolas, monospace; background-color: #F2F2F2; }
+.meta { color: #595959; font-size: 9.5pt; }
+.note { background-color: #FFF2CC; border-left: 3px solid #BF9000; padding: 6px 10px; }
+.key { background-color: #E2EFDA; border-left: 3px solid #548235; padding: 6px 10px; }
+</style>
+</head>
+<body>
+
+<h1>FMCW3 雷达数字后端移植到 XC7A35T<br>阶段进展报告</h1>
+
+<p class="meta">
+文档版本：v1.0　|　日期：2026-11-01　|　分支：lab-migration<br>
+目标器件：XC7A35T-FGG484-2（正点原子 达芬奇 Pro A7）　|　工具：Vivado 2025.2<br>
+配套详细技术笔记：<code>../FMCW3_项目总结与计划.md</code>（§0–§18）
+</p>
+
+<h2>一、项目背景与阶段目标</h2>
+
+<h3>1.1 项目来源</h3>
+<p>本工程源自开源项目 <code>ckflight/FMCW3</code>：一颗 Xilinx Artix-7（原设计为 FTG256 封装）负责 FMCW 雷达的数字后端——ADC 采集、FIR 抽取、斜坡（ramp）时序控制、USB 上传，配合 ADF4158 锁相环与 LTC2292 双通道 ADC 组成一套 5.8 GHz FMCW 雷达前端。</p>
+
+<h3>1.2 本阶段要解决的问题</h3>
+<p>我手上没有射频前端（没有 ADF4158、没有 LTC2292、也没有原设计的 FT2232H 双通道 USB 芯片），但有一块 <strong>XC7A35T-FGG484</strong> 开发板。因此本阶段的目标是：</p>
+<p class="key"><strong>在不接任何射频硬件的前提下，用 FPGA 内部产生的"假 ADC 数据"，把原工程的数字后端完整搬到这块板子上跑通，一直做到 PC 端能接收、能切帧、能做 FFT。</strong></p>
+
+<p>这条链路一旦跑通，"有真实射频前端"只是把假数据换成真数据的问题，数字链路本身不再有未知数。</p>
+
+<h3>1.3 本报告覆盖的判据</h3>
+<p>本阶段结束时应能回答四个问题：</p>
+<ol>
+<li>数据是否真的从 FPGA 走到了 PC？（字节数、速率）</li>
+<li>走过来的数据对不对？（采样率、数值连续性、增益）</li>
+<li>PC 端能否把字节流切成"一帧 = 一个 chirp"？（帧同步）</li>
+<li>对每帧做 FFT，结果是否与已知的信号特征吻合？（数值链路正确性）</li>
+</ol>
+<p><strong>四个问题在本报告中全部得到肯定答复</strong>，详见第三、五章。</p>
+
+<h2>二、完成情况总览</h2>
+
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:8%">里程碑</th><th style="width:26%">内容</th><th style="width:44%">验收证据</th><th style="width:10%">状态</th></tr>
+<tr><td>M1</td><td>工程迁移与器件核对</td><td>part 改为 <code>xc7a35tfgg484-2</code>；Block Design 器件同步；IP 升级完成</td><td>完成</td></tr>
+<tr><td>M2</td><td>lab 顶层综合、实现、烧写、ILA 在线验证</td><td>WNS 2.083 ns；LUT 40.22%、FF 18.40%、BRAM 51%、DSP 14.44%；ILA 抓到 RAMP/GAP 状态迁移与 mem 缓冲生效</td><td>完成</td></tr>
+<tr><td>M3</td><td>PC 端首次收到真实数据</td><td>5 秒收到 27,875,840 字节，稳定 5.31 MB/s；文件头 <code>FMCW</code> 校验通过</td><td>完成</td></tr>
+<tr><td>M4</td><td>定长帧 + 帧头 + 每帧 FFT 全部打通</td><td>3309 个帧头；2883 帧可用；帧首样本 min=max=0；平均 range-FFT 出现 9.766 kHz 整数倍谐波梳（1/n 衰减）</td><td>完成</td></tr>
+</table>
+
+<h2>三、已完成的步骤（详细）</h2>
+
+<h3>3.1 环境与器件核对</h3>
+<ul>
+<li>原工程 part 为 <code>xc7a35tftg256-1</code>（FTG256 封装），与本板 FGG484 封装不符，改为 <code>xc7a35tfgg484-2</code>；Block Design 内的器件字段同步更新。</li>
+<li>改 part 后 Vivado 报 "IP is locked"（IP 与器件绑定），用 <code>upgrade_ip [get_ips]</code> 与 <code>generate_target all</code> 解决。</li>
+<li>硬件差异核对：原设计用 <strong>FT2232H</strong>（双通道，A 通道做 FIFO、B 通道做 JTAG）；本板是 <strong>FT232H</strong>（单通道 FIFO）+ CH340（串口）+ 独立 10 pin JTAG 排针。因此 JTAG 下载器与 USB 数据口是两颗独立芯片，互不影响。</li>
+<li>实测 FT232H 在 <code>lsusb</code> 中显示为 "Future Technology Devices International"（不是 "FTDI" 字样），序列号 <code>FTC7EQO0</code>，PC 端脚本以序列号选设备。</li>
+</ul>
+
+<h3>3.2 时钟方案</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:26%">时钟</th><th style="width:16%">频率</th><th style="width:58%">用途</th></tr>
+<tr><td>板载 <code>sysclk</code></td><td>50 MHz</td><td>clk_wiz 输入，约束 20.000 ns</td></tr>
+<tr><td><code>clk_40mhz</code></td><td>40 MHz</td><td>假 ADC 计数器、双沿采样、FIR、control 状态机</td></tr>
+<tr><td><code>clk_100mhz</code></td><td>100 MHz</td><td>原 MicroBlaze 域（本阶段保留但数据通路不使用）</td></tr>
+<tr><td><code>usb_clkout</code></td><td>60 MHz</td><td>FT232H 回送的同步 FIFO 时钟，约束 16.667 ns</td></tr>
+</table>
+
+<h3>3.3 约束文件</h3>
+<p>新建 <code>FMCW3.srcs/constrs_1/new/lab_pinout.xdc</code>，与原有 <code>pinout.xdc</code>（原板 FTG256 引脚）二选一启用。</p>
+<p class="note"><strong>踩坑记录：</strong>XDC 里写中文注释和长破折号会导致该文件进入 Vivado 的 "Syntax Error Files" 列表，约束整体失效。改为<strong>纯 ASCII 注释</strong>后通过。</p>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:20%">信号</th><th style="width:14%">引脚</th><th style="width:18%">电平标准</th><th style="width:48%">说明</th></tr>
+<tr><td>sysclk</td><td>R4</td><td>LVCMOS15</td><td>50 MHz 板载时钟</td></tr>
+<tr><td>reset_n / led1</td><td>U7 / V9</td><td>LVCMOS15</td><td>复位、心跳灯</td></tr>
+<tr><td>usb_data[7:0]</td><td>C17 F15 F18 E18 E21 D21 F21 E22</td><td>LVCMOS33</td><td>FT232H 数据总线</td></tr>
+<tr><td>usb_rxf / usb_txe</td><td>F16 / E17</td><td>LVCMOS33</td><td>可读 / 可写标志</td></tr>
+<tr><td>usb_rd / usb_wr / usb_oe</td><td>F19 / F20 / D19</td><td>LVCMOS33</td><td>读选通 / 写选通 / 输出使能</td></tr>
+<tr><td>usb_siwua / usb_clkout</td><td>G21 / E19</td><td>LVCMOS33</td><td>发送立即 / 60 MHz 同步时钟</td></tr>
+</table>
+
+<h3>3.4 新增 lab 顶层 <code>top_module_lab.vhd</code></h3>
+<p>不修改原有 <code>top_module</code>（保留可作为将来接真射频的入口），新增一个实验顶层，内部包含：</p>
+<ul>
+<li><strong>假 ADC 数据源</strong>：12 位锯齿计数器（40 MHz 步进 1，4096 回绕），接到 <code>adc</code> 模块的 <code>adc_data</code> 输入，取代 LTC2292。</li>
+<li><strong>内部 muxout 发生器</strong>：取代 ADF4158 在 R0 回读模式产生的 muxout 脉冲，作为 control 状态机的斜坡起止信号。</li>
+<li><strong>配置通路旁路</strong>：<code>config_done</code> 恒 '1'、<code>ramp_configured</code> 恒 '1'、<code>sampling_done</code> 恒 '0'，即不需要 PC 下发配置包、也不需要 MicroBlaze 介入，上电即连续采集。</li>
+<li><strong>ILA 探针</strong>：观察 control 状态、当前发送字节、当前 FIR 输出、FIFO 标志。</li>
+</ul>
+
+<h3>3.5 首次综合、实现与烧写</h3>
+<p>Vivado 2025.2，时序收敛，资源占用情况：</p>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:34%">指标</th><th style="width:22%">数值</th><th style="width:44%">说明</th></tr>
+<tr><td>WNS（最差建立时间裕量）</td><td>2.083 ns（后续版本 2.680 ns）</td><td>正裕量，时序收敛</td></tr>
+<tr><td>Slice LUT</td><td>40.22%</td><td>其中约 1000 LUT 用于 32 位 × 1000 采样缓冲（分布式 RAM）</td></tr>
+<tr><td>Slice Register</td><td>18.40%</td><td></td></tr>
+<tr><td>Block RAM</td><td>51.00%</td><td>主要是 MicroBlaze 的 LMB BRAM</td></tr>
+<tr><td>DSP</td><td>14.44%</td><td>两个 FIR 编译器实例</td></tr>
+</table>
+<p>烧写成功后板载 LED 以 <code>led_cnt(23)</code> 心跳闪烁，确认时钟与复位正常。</p>
+
+<h3>3.6 ILA 在线验证</h3>
+<p>用 ILA 在真实硬件上抓取状态机行为，确认了三件事：</p>
+<ul>
+<li><strong>状态迁移正确</strong>：状态编码依次出现 <code>0x005</code>（RAMP，斜坡采集）→ <code>0x004</code>（过渡）→ <code>0x0F4</code>（GAP_WAIT，ADC 关闭）→ <code>0x0F6 ⇄ 0x0F2</code>（USB_TX_IDLE 与 USB_TX_PULSE 交替）。</li>
+<li><strong>字节时序正确</strong>：<code>probe0</code> 在 <code>00 ⇄ D7</code> 之间跳变，对应存储字 <code>0x00D700D7</code>，说明按 MSB 先发、每字 4 字节。</li>
+<li><strong>缓存生效</strong>：发送阶段发出的仍是旧值 <code>0x00D7</code>，而此刻 FIR 输出已涨到 <code>0x01AE</code> —— 证明"斜坡期间存、间隙期间发"的缓冲机制确实在工作。</li>
+</ul>
+<p class="note"><strong>踩坑记录：</strong>最初设置的 ILA 触发条件 <code>s_probe3 == 0x001</code> 永远不触发，因为该状态组合（write_n=0 且 chipselect=0 且 muxout=1）在逻辑上不可达。改用可达到的条件（<code>0x800</code>、<code>0x005</code>）后正常。</p>
+
+<h3>3.7 PC 端首次接收</h3>
+<p>PC 端沿用工程自带的 <code>FMCW3_record.py</code>（pylibftdi），把 <code>DEVICE_ID</code> 改为 <code>FTC7EQO0</code>，用 <code>ftdi_set_bitmode(0xFF, 0x40)</code> 把 FT232H 切到同步 FIFO 模式。首轮结果：</p>
+<pre><code>RX   1024 bytes   DATA   27875328 bytes     5.31 MB/s
+RECORD_TIME reached: 5 s. Ending reception.
+SAVED: record.bin
+TOTAL BYTES: 27875840
+DATA BYTES : 27875328</code></pre>
+<p>文件结构 = 512 字节 info sector（<code>FMCW</code> 魔数 + 小端参数）+ 其后纯字节流，<strong>没有帧头</strong>。</p>
+
+<h3>3.8 数据取证：这批数据到底是什么</h3>
+<p>因为原始数据没有帧头，必须先用"已知答案"的信号反推。测试信号是 12 位锯齿计数器，周期已知（4096 / 40 MHz = 102.4 µs），因此可以反推采样率。逐层验证得到六条结论：</p>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:5%">#</th><th style="width:28%">结论</th><th style="width:67%">证据</th></tr>
+<tr><td>1</td><td>字格式 = <code>A&lt;&lt;16 | B</code>，且 A/B 是<strong>有符号 int16</strong></td><td>锯齿换向时 FIR 下冲，出现 <code>0xFFFD = -3</code>；按无符号解析会误判 44% 的好数据</td></tr>
+<tr><td>2</td><td>采样率实测 <strong>2.002 MSPS</strong>，与设计 40 MHz / 20 一致</td><td>实测锯齿周期 204/205 个样本 ÷ 102.4 µs</td></tr>
+<tr><td>3</td><td>段内数据<strong>逐字节正确</strong></td><td>步进 5.538 counts；线性拟合残差 rms = 0.288 counts（小于 1 LSB）</td></tr>
+<tr><td>4</td><td>FIR 直流增益 ≈ <strong>0.273</strong></td><td>输入 4096 counts 斜坡，输出约 1118 counts</td></tr>
+<tr><td>5</td><td><strong>存在字节滑移</strong>：431 次 / 5 秒（约每 1.6 万词一次）</td><td>丢 1 字节后 4 字节帧持续偏移；全局对齐匹配率仅 56%，按窗跟踪相位后 96.6%</td></tr>
+<tr><td>6</td><td><strong>帧长不固定</strong>（800~1000 抖动）</td><td>上传 4000 字节需约 750 µs，但两段斜坡之间只留了 100 µs</td></tr>
+</table>
+
+<h3>3.9 第一次修复（四项改动）</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:6%">#</th><th style="width:30%">改动</th><th style="width:64%">目的</th></tr>
+<tr><td>1</td><td><code>usb_tx_full =&gt; s_tx_full</code></td><td>恢复真实反压。原代码为调试 ILA 把该信号恒接 <code>'0'</code>，等于告诉状态机"FIFO 永远有空位"，FIFO 满时写入被静默丢弃</td></tr>
+<tr><td>2</td><td><code>MAX_ADC_SAMPLES = 1000</code></td><td>试图把帧长固定下来</td></tr>
+<tr><td>3</td><td>muxout 改为 510 µs 高 / 1000 µs 低</td><td>510 µs × 2 MSPS = 1020 个样本，略多于目标帧长；1000 µs 间隙足够发完 4000 字节</td></tr>
+<tr><td>4</td><td>间隙期间把测试计数器清零</td><td>制造"帧起点标记"：每帧第 0 个样本必然接近 0，PC 可自证切帧是否正确</td></tr>
+</table>
+
+<h3>3.10 第二次录数据：一半问题解决，另一半暴露</h3>
+<p>新数据 13.50 MB / 5 s（2.70 MB/s），与新的时序预算（4004 字节 / 1510 µs）精确吻合，采样率仍是 2.002 MSPS —— <strong>说明时序那一半改对了</strong>。但字节滑移不但没消失，反而更密（814 次 / 5 秒，约每 4145 词一次），帧起点标记命中率只有 6.3%。</p>
+<p>排查 <code>usb_sync.vhd</code> 的发送路径，其时序是确定性的（每个时钟弹一个字节），因此丢字节发生在 <strong>FT232H 的 USB 事务边界</strong>上（245 同步 FIFO 内部为 16 位缓冲，非整包长度的事务收尾容易吞/吐 1 字节）。这是芯片行为，靠调 FPGA 时序难以根治。</p>
+
+<h3>3.11 最终方案：每帧自带帧头（magic word）</h3>
+<p class="key"><strong>工程思路的转变：不再追求"字节永不丢"，而是让接收端能从任意位置重新同步。</strong>这是所有真实雷达与数据链路的标准做法。</p>
+<p>在 <code>control.vhd</code> 中，每帧上传前先发 4 字节帧头：</p>
+<pre><code>每帧 = [F0 0D F0 0D] + N 个样本字    （N 由 ramp 长度决定，当前为 1020）</code></pre>
+<p>选择 <code>F0 0D F0 0D</code> 的理由：有效样本的高字节只可能是 <code>0x00..0x0F</code>（滤波后幅度在 ±4000 内），因此 <code>0xF0</code> 出现在高字节位置<strong>物理上不可能</strong>，搜索该魔数零误判。</p>
+<p>PC 端相应改为：搜索帧头 → 从帧头后取 <code>N</code> 个样本 → 帧长 <code>N</code> 由帧头间距自动推断（协议自描述，不再与 FPGA 常量硬耦合）→ 逐帧做 range-FFT。</p>
+
+<h2>四、遇到的问题、根因与解决方案</h2>
+
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:5%">编号</th><th style="width:22%">问题</th><th style="width:31%">根因</th><th style="width:31%">解决方案</th><th style="width:11%">效果</th></tr>
+<tr><td>P1</td><td>改器件后 IP 全部锁定</td><td>IP 与器件型号绑定</td><td><code>upgrade_ip</code> + <code>generate_target all</code></td><td>解除</td></tr>
+<tr><td>P2</td><td>约束文件不生效</td><td>XDC 中含中文与长破折号，被判语法错误</td><td>改为纯 ASCII 注释</td><td>解除</td></tr>
+<tr><td>P3</td><td>ILA 触发条件永不满足</td><td>所设状态组合逻辑上不可达</td><td>改用可达状态编码作为触发</td><td>解除</td></tr>
+<tr><td>P4</td><td>USB 无法通信</td><td>原设计假设 FT2232H 双通道，本板为 FT232H 单通道</td><td>以序列号选设备，脚本切同步 FIFO 模式</td><td>通信成功</td></tr>
+<tr><td>P5</td><td>约 44% 数据被判为"垃圾"</td><td>FIR 输出为有符号 16 位，PC 按无符号解析</td><td>按 <code>int16</code> 解析</td><td>误判归零</td></tr>
+<tr><td>P6</td><td>数据中段之后全部错乱</td><td>链路丢 1 字节 → 4 字节栅格永久偏移</td><td>先按窗口跟踪字节相位；最终用帧头重同步</td><td>见 P8/P10</td></tr>
+<tr><td>P7</td><td>帧长在 800~1000 抖动</td><td>上传 4000 字节需 750 µs，间隙只有 100 µs，下一段斜坡开始时状态机还在发数据</td><td>间隙加长到 1000 µs；斜坡略长于目标帧长</td><td>帧长恒定</td></tr>
+<tr><td>P8</td><td>FPGA 侧静默丢字节</td><td><code>usb_tx_full</code> 被恒接 <code>'0'</code>，FIFO 满时写入被丢弃</td><td>接回真实反压信号</td><td>该路径消除</td></tr>
+<tr><td>P9</td><td>帧长为 1020 而非设定的 1000</td><td>VHDL <code>integer range 0 to 999</code> 在综合时不被强制，实际按 10 位计数器实现（可数到 1023）；ramp 产出 1020 个样本 &lt; 1024，故不绕回</td><td>PC 端改为从帧头间距反推帧长；FPGA 侧待改为真正饱和（见第七章）</td><td>功能正常但存隐患</td></tr>
+<tr><td>P10</td><td>PC 与 FPGA 帧长硬耦合</td><td>脚本里写死 <code>N=1000</code></td><td>协议自描述：帧长由帧头间距推断</td><td>解耦</td></tr>
+</table>
+
+<h3>4.1 重点问题详解</h3>
+
+<h4>P6 / P8："丢一个字节"为什么具有毁灭性</h4>
+<p>FPGA 每采到一对样本就打成一个 32 位字，拆 4 个字节发出：<code>[A高][A低][B高][B低]</code>。PC 端按"每 4 字节切一刀"还原。一旦链路丢掉 1 个字节，从那一刻起<strong>每 4 个字节都横跨两个真实样本</strong>，还原结果全部错乱。</p>
+<p>迷惑之处在于错位后的字节看起来像"大小端翻转"（<code>02 97</code> 变成 <code>97 02</code>）。区分方法：<strong>真的大小端错误是全程一致的，而丢字节是"之前一直正确、某个位置之后全错"</strong>。如果误判成大小端去改字节序，将永远修不好。</p>
+
+<h4>P7：带宽预算必须算清楚</h4>
+<p>数据产生率 = 2 MSPS × 4 字节 = 8.0 MB/s，而 USB 实测只有 5.31 MB/s。<strong>即使一个字节都不丢，也必然有一部分时间被上传占用</strong>。正确做法是把占空比压到带宽之下：本设计用"斜坡 510 µs + 间隙 1000 µs"，每帧 4084 字节，对应 2.70 MB/s，留出约一倍余量。</p>
+
+<h4>P9：VHDL 的 <code>range</code> 约束不是硬件约束</h4>
+<pre><code>signal sample_idx : integer range 0 to MAX_SAMPLES-1 := 0;   -- 0..999
+if adc_valid = '1' and sample_idx &lt; MAX_SAMPLES then
+    sample_idx &lt;= sample_idx + 1;      -- 综合时不检查 range
+end if;</code></pre>
+<p>999 需要 10 位，于是综合出的计数器实际能数到 1023。本次 ramp 产出 1020 个样本（小于 1024），因此没有绕回，数据恰好正确——但这是<strong>侥幸正确</strong>：一旦 ramp 产出超过 1024 个样本，索引会绕回 0 覆盖开头数据，而且是<strong>静默损坏</strong>。必须改为显式饱和。</p>
+
+<h2>五、改进效果量化对比</h2>
+
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:28%">指标</th><th style="width:22%">第一版（原始逻辑）</th><th style="width:22%">第二版（反压+时序）</th><th style="width:28%">第三版（帧头，当前）</th></tr>
+<tr><td>数据量 / 5 秒</td><td>27.88 MB</td><td>13.50 MB</td><td>13.51 MB</td></tr>
+<tr><td>字节率</td><td>5.31 MB/s</td><td>2.70 MB/s</td><td>2.70 MB/s</td></tr>
+<tr><td>采样率实测</td><td>2.002 MSPS</td><td>2.002 MSPS</td><td>2.002 MSPS</td></tr>
+<tr><td>段内线性残差</td><td>0.288 counts</td><td>0.289 counts</td><td>&lt; 1 LSB</td></tr>
+<tr><td>帧长确定性</td><td>800~1000 抖动</td><td>恒定 1020（但未声明）</td><td>恒定 1020，PC 自动推断</td></tr>
+<tr><td>帧同步能力</td><td>无（全局对齐 56%）</td><td>无</td><td><strong>帧头同步，3307/3308 帧相位稳定</strong></td></tr>
+<tr><td>帧起点标记命中</td><td>—</td><td>6.3%</td><td><strong>100%（min=max=0）</strong></td></tr>
+<tr><td>可用帧比例</td><td>无法切帧</td><td>0%</td><td><strong>87.2%（2883/3308）</strong></td></tr>
+<tr><td>FFT 验证</td><td>无</td><td>无</td><td><strong>9.766 kHz 谐波梳，按 1/n 衰减</strong></td></tr>
+</table>
+
+<h3>5.1 第三版的关键验证结果</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:34%">指标</th><th style="width:32%">结果</th><th style="width:34%">判据</th></tr>
+<tr><td>帧头数量</td><td>3309</td><td>5 s ÷ 1.51 ms ≈ 3310</td></tr>
+<tr><td>帧头间距</td><td>中位数 4084 字节，86.8% 恰等于该值</td><td>恒定</td></tr>
+<tr><td>每帧字节相位</td><td>3307/3308 帧为 phase 0</td><td>不漂移</td></tr>
+<tr><td>帧首样本</td><td>2883 帧 min = max = 0</td><td>精确对齐</td></tr>
+<tr><td>斜坡斜率</td><td>中位数 5.5271 counts/word</td><td>理论 5.54</td></tr>
+<tr><td>帧率</td><td>660.9 帧/秒（1.51 ms/帧）</td><td>510 + 1000 µs</td></tr>
+<tr><td>平均 range-FFT 峰值</td><td>9.80 / 19.61 / 29.41 / 39.22 / 49.02 / 58.82 kHz</td><td>9.766 kHz 整数倍</td></tr>
+<tr><td>峰值衰减</td><td>-6.0 / -9.6 / -12.1 / -14.0 / -15.7 / -17.0 / -18.2 dB</td><td>锯齿波 1/n 谐波特征</td></tr>
+</table>
+
+<p><img src="frame_analysis.png" style="width:16.5cm"><br>
+<span class="meta">图 1　第三版验证结果：上两图为连续三帧（几乎逐点重合）与帧首 60 个样本；第三图为保留帧的帧首样本（恒为 0）；第四图为 2883 帧平均 range-FFT，红色虚线为 9.766 kHz 的整数倍，可见谐波梳按 1/n 衰减。</span></p>
+
+<p><img src="record_analysis.png" style="width:16.5cm"><br>
+<span class="meta">图 2　第一次数据取证：最长连续干净段的锯齿波形（含 FIR 换向振铃细节）、样本步进直方图、以及该段数据的频谱。</span></p>
+
+<h2>六、当前版本状态与复现方法</h2>
+
+<h3>6.1 关键文件</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:44%">文件</th><th style="width:56%">作用</th></tr>
+<tr><td><code>FMCW3.srcs/sources_1/new/top_module_lab.vhd</code></td><td>实验顶层：假 ADC、内部 muxout、定长帧时序、帧起点标记</td></tr>
+<tr><td><code>FMCW3.srcs/sources_1/new/control.vhd</code></td><td>斜坡状态机（已加入帧头逻辑与真实反压）</td></tr>
+<tr><td><code>FMCW3.srcs/constrs_1/new/lab_pinout.xdc</code></td><td>本板引脚约束（纯 ASCII）</td></tr>
+<tr><td><code>pc/analyze_record.py</code></td><td>数据取证：字节相位跟踪、滑移统计、采样率反推、线性拟合残差</td></tr>
+<tr><td><code>pc/decode_frames.py</code></td><td>帧头搜索 → 自动推断帧长 → 切帧 → 每帧 range-FFT</td></tr>
+<tr><td><code>pc/build_lab.tcl</code></td><td>批处理综合/实现/出比特流，打印 WNS</td></tr>
+<tr><td><code>FMCW3.runs/impl_1/top_module_lab.bit</code></td><td>当前比特流（WNS 2.680 ns）</td></tr>
+</table>
+
+<h3>6.2 构建与验证命令</h3>
+<pre><code># 1) 综合 + 实现 + 出比特流
+cd ~/myProjects/ISAC/FMCW3
+vivado -mode batch -source pc/build_lab.tcl -nojournal -log pc/build_lab.log
+
+# 2) 在 Hardware Manager 里 Program Device 烧写 top_module_lab.bit
+
+# 3) 录数据（Python 环境为工程内 .venv）
+cd ~/myProjects/ISAC/FMCW-RADAR-2v2
+~/myProjects/ISAC/FMCW3/.venv/bin/python FMCW3_record.py
+
+# 4) 切帧 + FFT 验证
+cd ~/myProjects/ISAC/FMCW3
+MPLCONFIGDIR=/tmp/mplcache .venv/bin/python pc/decode_frames.py ~/myProjects/ISAC/FMCW-RADAR-2v2/record.bin</code></pre>
+
+<h3>6.3 当前链路的完整数据格式</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:24%">层级</th><th style="width:76%">格式</th></tr>
+<tr><td>采样</td><td>40 MHz 双沿采样：A 取上升沿、B 取下降沿；各自经 120 抽头 FIR、抽取 20 → 2 MSPS，输出为<strong>有符号 16 位</strong>，直流增益约 0.273</td></tr>
+<tr><td>字</td><td><code>word = A&lt;&lt;16 | B</code>，字节发送顺序 <code>A高, A低, B高, B低</code></td></tr>
+<tr><td>帧</td><td><code>[F0 0D F0 0D]</code> + 1020 个样本字 = 4084 字节</td></tr>
+<tr><td>帧周期</td><td>1510 µs（斜坡 510 µs + 间隙 1000 µs）→ 约 661 帧/秒</td></tr>
+<tr><td>文件</td><td>512 字节 info sector（<code>FMCW</code> + 小端参数）+ 连续帧字节流</td></tr>
+</table>
+
+<h2>七、下一步行动目标与方案建议</h2>
+
+<h3>7.1 优先级 A：把锯齿换成可编程拍频正弦（NCO）</h3>
+<p><strong>目标：</strong>当前 FFT 看到的是锯齿波的谐波梳，虽然验证了数值链路，但没有"距离"的物理含义。把假信号换成频率可控的正弦后，FFT 峰值位置就等于设定的拍频，才能接上 FMCW 的距离公式。</p>
+<p><strong>方案：</strong>32 位相位累加器 + 正弦查找表（1024 点，可外挂 coe 初始化），累加器频率字</p>
+<p style="margin-left:24px"><code>f_out = (f_word / 2^32) × 40 MHz</code>　例如 100 kHz 对应 <code>f_word ≈ 10 737 418</code></p>
+<p>建议先取 100 kHz（落在 400 kHz 低通通带内、远离直流与抽取后 1 MHz 的奈奎斯特边界），并用一个常量便于修改。</p>
+<p><strong>验收标准：</strong>平均 range-FFT 的单峰落在设定频率 ±1 个频率分辨单元内（当前帧 1020 点 @2 MSPS，分辨率约 1.96 kHz），带外杂散低于 -40 dBc，帧首标记仍为 0。</p>
+<p><strong>工作量：</strong>约 30 行 VHDL，一次综合（约 8 分钟）＋ 一次录制验证。</p>
+
+<h3>7.2 优先级 B：修掉帧长的静默隐患</h3>
+<p><strong>问题：</strong>见 P9。当前"侥幸正确"依赖 ramp 产出样本数不超过 1024。</p>
+<p><strong>方案：</strong>把存数逻辑改为真正饱和（<code>if sample_idx &lt; MAX_SAMPLES-1 then sample_idx &lt;= sample_idx + 1</code>），并把 <code>MAX_ADC_SAMPLES</code> 设为 1020 使常量名副其实；同时把 PC 端帧长推断保留为兜底。</p>
+<p><strong>验收标准：</strong>把 ramp 故意加长到超过 1024 个样本，帧长仍严格等于设定值，数据无覆盖、无跳变。</p>
+<p><strong>建议：</strong>与 7.1 合并为同一次综合。</p>
+
+<h3>7.3 中期目标：慢时间维 → 距离-多普勒图（RD Map）</h3>
+<p>在 7.1 基础上，让每帧起始相位按固定增量旋转（模拟目标匀速运动引起的多普勒频移），然后对"帧间同一距离单元"做第二次 FFT：</p>
+<ul>
+<li>快时间 FFT（帧内）→ 距离；</li>
+<li>慢时间 FFT（帧间，同一 range bin 跨 N 帧）→ 速度；</li>
+<li>两级结果拼成 RD 图并做可视化。</li>
+</ul>
+<p><strong>验收标准：</strong>设定"目标距离 + 目标速度"后，RD 图峰值落在理论位置，且与公式 <code>R = c·f_b·T/(2·BW)</code>、<code>v = f_d·λ/2</code> 一致。</p>
+
+<h3>7.4 中期目标：配置通路与 MicroBlaze</h3>
+<p>目前配置通路是旁路的（<code>config_done</code> 恒为 1）。若要由 PC 动态设定斜坡时间、带宽、帧长，需要：</p>
+<ul>
+<li>对齐配置包长度（PC 发送 26 字节，FPGA 侧期望 128/256 字节）；</li>
+<li>补齐 <code>helloworld.c</code> 的字段解析（当前只解析了 3 个字段）；</li>
+<li>恢复 MicroBlaze 对 ADF4158 的 SPI 配置（接真射频时必需）。</li>
+</ul>
+
+<h3>7.5 风险与注意事项</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:30%">风险</th><th style="width:70%">说明与对策</th></tr>
+<tr><td>FT232H 事务边界丢字节</td><td>当前约每 7~8 帧丢 1 字节，被帧头机制隔离，可用帧 87.2%。若要提升，可让每次 USB 事务长度为偶数包，或把帧头扩展为"魔数 + 帧号 + 帧长 + 校验"，实现坏帧精确定位</td></tr>
+<tr><td>帧长与 FFT 点数</td><td>1020 点不是 2 的幂，且锯齿周期 204.8 点不是整数。换成正弦信号后不影响峰值位置，但若要做零填充或高分辨率谱，建议把帧长取成 2 的幂并与 ramp 时长精确匹配</td></tr>
+<tr><td>有符号与增益</td><td>FIR 输出为有符号且直流增益约 0.273，做幅度/信噪比计算时必须乘回 1/0.273</td></tr>
+<tr><td>分布式 RAM 占用</td><td>1000×32 位采样缓冲占用约 1000 LUT（占全片 40%）。若后续加大帧长，应改用 <code>ram_style="block"</code> 走 BRAM</td></tr>
+<tr><td>版本管理</td><td>仓库当前把 <code>FMCW3.runs / FMCW3.cache / FMCW3.gen</code> 一并纳入跟踪，每次综合都会产生大量无关改动。建议后续加入 <code>.gitignore</code>，只跟踪源码、约束、脚本与文档</td></tr>
+</table>
+
+<h2>八、附录：关键数字速查</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th style="width:52%">项目</th><th style="width:48%">数值</th></tr>
+<tr><td>ADC / FIR 采样率</td><td>40 MHz / 20 = 2.000 MSPS（实测 2.002）</td></tr>
+<tr><td>FIR 抽头数 / 抽取率 / 直流增益</td><td>120 / 20 / ≈0.273</td></tr>
+<tr><td>斜坡（ramp）时长</td><td>510 µs（20400 个 40 MHz 周期）</td></tr>
+<tr><td>间隙时长</td><td>1000 µs（40000 个周期）</td></tr>
+<tr><td>每帧样本数 / 字节数</td><td>1020 / 4084（含 4 字节帧头）</td></tr>
+<tr><td>帧率</td><td>≈661 帧/秒（1.51 ms/帧）</td></tr>
+<tr><td>帧头魔数</td><td><code>F0 0D F0 0D</code></td></tr>
+<tr><td>字节率 / 5 秒数据量</td><td>2.70 MB/s / 13.51 MB</td></tr>
+<tr><td>锯齿测试信号周期</td><td>4096 / 40 MHz = 102.4 µs（≈204.8 个样本）</td></tr>
+<tr><td>时序裕量 WNS</td><td>2.680 ns（当前比特流）</td></tr>
+</table>
+
+<p class="meta">本报告由工程内脚本与数据实测结果整理，配套的推演过程与逐轮实验记录见 <code>../FMCW3_项目总结与计划.md</code>。</p>
+
+</body>
+</html>

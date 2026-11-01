@@ -1,0 +1,21 @@
+# Vivado transient / build artifacts
+.Xil/
+*.jou
+*.log
+*.str
+*.backup.*
+vivado_*.backup.*
+vivado_pid*.str
+
+# Local python environment for the PC-side scripts
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / tooling
+.vscode/
+.dsh_fix/
+
+# Datasets (recorded over USB, keep them out of git)
+record.bin
+*.bin
